@@ -5,10 +5,13 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "build": "npm install --build-from-source",
+    "postinstall": "npm rebuild better-sqlite3 --build-from-source",
+    "dev": "nodemon server.js",
+    "clean": "rm -rf node_modules package-lock.json && npm install"
   },
   "dependencies": {
-    "better-sqlite3": "^12.8.0",
+    "better-sqlite3": "^11.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.18.2",
@@ -24,5 +27,16 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
-  }
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "keywords": [
+    "milkyway",
+    "roulette",
+    "bot"
+  ],
+  "author": "",
+  "license": "ISC"
 }
