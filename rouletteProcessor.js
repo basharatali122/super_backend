@@ -126,7 +126,7 @@ class UltimateRouletteProcessor extends EventEmitter {
 
     // ── Core config — tuned for 3,000/hr ─────────────────────────────────────
     this.config = {
-      LOGIN_WS_URL: 'wss://game.milkywayapp.xyz:7878/',      SUPER_ROULETTE_WS_URL: 'wss://game.milkywayapp.xyz:10152/',
+      LOGIN_WS_URL: 'wss://game.milkywayapp.xyz:7878/',      SUPER_ROULETTE_WS_URL: 'wss://game.milkywayapp.xyz:2152/',
    GAME_VERSION: '2.0.1',
 
 
