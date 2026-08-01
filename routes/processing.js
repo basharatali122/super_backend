@@ -1,18 +1,5 @@
 const router = require('express').Router();
 
-/**
- * FIXED: Route ordering bug.
- * 
- * THE BUG: The original code defined GET /all/status AFTER the parametric
- * routes like /:profile/start. Express matches routes in order, so when a
- * request came in for GET /processing/all/status, the router tried to match
- * "all" as a :profile value and called getInstance(userId, "all") instead
- * of hitting the all-status handler. This returned empty/wrong data.
- *
- * THE FIX: /all/status is declared FIRST, before any /:profile routes.
- * Static route segments always beat parametric ones when declared first.
- */
-
 // GET /api/processing/all/status — MUST be before /:profile routes
 router.get('/all/status', (req, res) => {
   try {
@@ -38,10 +25,7 @@ router.post('/:profile/start', async (req, res) => {
 
     const { accountIds, repetitions = 1, betAmount, gameConfig } = req.body;
 
-    // ── Apply game server config if provided ────────────────────────────────
-    // gameConfig carries { LOGIN_WS_URL, SUPER_ROULETTE_WS_URL, GAME_VERSION }
-    // sent from the frontend game selector. Merge into processor.config so
-    // it connects to the selected game server for this run.
+    // Apply game server config if provided
     if (gameConfig && typeof gameConfig === 'object') {
       const allowed = ['LOGIN_WS_URL', 'SUPER_ROULETTE_WS_URL', 'GAME_VERSION'];
       for (const key of allowed) {
@@ -49,41 +33,34 @@ router.post('/:profile/start', async (req, res) => {
           processor.config[key] = gameConfig[key];
         }
       }
-      console.log(`🎮 [${req.userId}:${req.params.profile}] Game server → ${gameConfig.LOGIN_WS_URL || 'default'}`);
     }
-    // ────────────────────────────────────────────────────────────────────────
 
-    // Load proxy config from this profile's own database
+    // Load proxy config from DB
     const proxyConfig = db.getProxyConfig();
-    let useProxy = false;
+    let useProxy  = false;
     let proxyList = [];
 
     if (proxyConfig?.enabled) {
-      useProxy = true;
+      useProxy  = true;
       proxyList = Array.isArray(proxyConfig.proxyList)
         ? proxyConfig.proxyList
         : (proxyConfig.proxyList || '').split('\n').filter(Boolean);
-
-      if (proxyList.length > 0) {
-        try {
-          const u = new URL(proxyList[0]);
-          processor.proxyIpKey = `proxy_${u.hostname}_${u.port}`;
-        } catch (_) {}
-      }
     }
 
-    if (betAmount) processor.handleBetChange(betAmount);
-
+    // Get account IDs
     let ids = accountIds;
     if (!ids || ids.length === 0) {
       const accounts = db.getAllAccounts();
       ids = accounts.map(a => a.id);
     }
 
+    if (betAmount) processor.handleBetChange(betAmount);
+
+    // startProcessing will throw PROXY_REQUIRED if proxy not configured
     const result = await processor.startProcessing(ids, repetitions, useProxy, proxyList);
     res.json({ success: true, ...result });
   } catch (err) {
-    // PROXY_REQUIRED = user config error, not a server error -> 400 not 500
+    // PROXY_REQUIRED = user config error → 400, not 500
     const isProxyError = err.message?.startsWith('PROXY_REQUIRED:');
     const status = isProxyError ? 400 : 500;
     const msg = isProxyError ? err.message.replace('PROXY_REQUIRED: ', '') : err.message;
@@ -112,15 +89,13 @@ router.get('/:profile/status', async (req, res) => {
     if (!instance) return res.json({ running: false });
     const p = instance.processor;
     res.json({
-      running: p.isProcessing,
-      currentCycle: p.currentCycle,
-      totalCycles: p.totalCycles,
-      currentBet: p.getCurrentBetAmount(),
-      proxyEnabled: p.useProxy,
-      proxyIpKey: p.proxyIpKey,
+      running:         p.isProcessing,
+      currentCycle:    p.currentCycle,
+      totalCycles:     p.totalCycles,
+      currentBet:      p.getCurrentBetAmount(),
+      proxyEnabled:    p.useProxy,
       adaptiveStagger: p.adaptiveState?.currentStaggerMs,
-      // Return the game server currently in use so the frontend can display it
-      activeGameUrl: p.config?.LOGIN_WS_URL || null,
+      activeGameUrl:   p.config?.LOGIN_WS_URL || null,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
