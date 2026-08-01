@@ -1172,16 +1172,34 @@ class StealthRouletteProcessor extends EventEmitter {
   async startProcessing(accountIds, repetitions = 1, useProxy = false, proxyList = []) {
     if (this.isProcessing) throw new Error('Already processing');
 
+    // PROXY MANDATORY CHECK
+    // Processing without proxies = all requests from 1 server IP = instant ban.
+    const validProxies = (proxyList || []).filter(p => {
+      const s = (p || '').trim();
+      return s.startsWith('socks5://') || s.startsWith('socks5h://') ||
+             s.startsWith('socks4://') || s.startsWith('http://') || s.startsWith('https://');
+    });
+
+    if (!useProxy || validProxies.length === 0) {
+      const reason = !useProxy
+        ? 'Proxy is disabled. Enable proxy and add proxy list before starting.'
+        : 'Proxy enabled but no valid proxies found. Add proxies in the Proxy tab first.';
+      this.emit('terminal', { type: 'error', message: `\uD83D\uDEAB BLOCKED: ${reason}` });
+      this.emit('terminal', { type: 'warning', message: '\u26A0\uFE0F Processing requires proxies to protect the server IP from bans.' });
+      this.emit('status', { running: false });
+      throw new Error(`PROXY_REQUIRED: ${reason}`);
+    }
+
     await this.cleanup();
     this.isProcessing = true;
-    this.useProxy = useProxy;
-    this.proxyList = proxyList || [];
+    this.useProxy = true;
+    this.proxyList = validProxies;
 
     // Get accounts and SHUFFLE for natural order (no pattern)
     const accounts = await this.db.getAllAccounts();
     this.currentAccounts = accounts.filter(a => accountIds.includes(a.id));
     
-    // 🔄 SHUFFLE accounts - prevents sequential pattern detection
+    // SHUFFLE accounts - prevents sequential pattern detection
     if (this.config.RANDOM_ORDER) {
       for (let i = this.currentAccounts.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -1192,15 +1210,16 @@ class StealthRouletteProcessor extends EventEmitter {
     this.totalCycles = Math.max(1, Math.min(10, parseInt(repetitions) || 1));
     this.currentCycle = 0;
 
-    this.emit('terminal', { type: 'info', message: '🦎 STEALTH MODE ACTIVATED - Undetectable Processing' });
-    this.emit('terminal', { type: 'info', message: `📋 Accounts: ${this.currentAccounts.length}` });
-    this.emit('terminal', { type: 'info', message: `🎲 Random delays: ${this.config.MESSAGE_DELAY_MS.MIN}-${this.config.MESSAGE_DELAY_MS.MAX}ms` });
-    this.emit('terminal', { type: 'info', message: `🔄 Natural rotation: ENABLED` });
+    this.emit('terminal', { type: 'info', message: '\uD83E\uDD8E STEALTH MODE ACTIVATED - Undetectable Processing' });
+    this.emit('terminal', { type: 'info', message: `\uD83D\uDCCB Accounts: ${this.currentAccounts.length}` });
+    this.emit('terminal', { type: 'info', message: `\uD83C\uDF10 Proxy: ON (${validProxies.length} IPs, random rotation)` });
+    this.emit('terminal', { type: 'info', message: `\uD83C\uDFB2 Random delays: ${this.config.MESSAGE_DELAY_MS.MIN}-${this.config.MESSAGE_DELAY_MS.MAX}ms` });
+    this.emit('terminal', { type: 'info', message: `\uD83D\uDD04 Natural rotation: ENABLED` });
 
     this.startMonitor();
     this.processCycles();
 
-    return { started: true, totalAccounts: this.currentAccounts.length };
+    return { started: true, totalAccounts: this.currentAccounts.length, proxyCount: validProxies.length };
   }
 
   async processCycles() {
@@ -1329,7 +1348,8 @@ class StealthRouletteProcessor extends EventEmitter {
     
     const proxy = this.getProxyForAccount(index);
     
-    this.log(index, 'info', `🦎 ${fingerprint.model.substring(0, 15)} | ${fingerprint.timezone.split('/')[1]}`);
+    this.log(index, 'info', `🛡️ ${sessionId.substring(0,8)} | ${fingerprint.model.substring(0, 15)} | ${fingerprint.timezone.split('/')[1]}`);
+    if (proxy) this.log(index, 'debug', `🔌 ${proxy.replace(/\/\/.*@/, '//*@')}`);
     
     // Random session duration (real users stay logged in for varying times)
     // sessionDuration is the TOTAL time budget for login + game.
@@ -1612,9 +1632,13 @@ class StealthRouletteProcessor extends EventEmitter {
 
   getProxyForAccount(index) {
     if (!this.useProxy || this.proxyList.length === 0) return null;
-    // Random proxy assignment (not sequential)
-    const randomProxyIndex = Math.floor(Math.random() * this.proxyList.length);
-    return this.proxyList[randomProxyIndex];
+    // Round-robin rotation: account index 0→proxy[0], 1→proxy[1], ...
+    // When accounts > proxies, wraps around: index % length
+    // Matches super.zip log pattern:
+    //   [C1][0]  🔌 socks5h://*@IP_0
+    //   [C1][1]  🔌 socks5h://*@IP_1
+    //   [C1][53] 🔌 socks5h://*@IP_0  ← wrap
+    return this.proxyList[index % this.proxyList.length];
   }
 
   makeProxyAgent(proxyUrl) {
