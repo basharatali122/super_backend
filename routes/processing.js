@@ -83,7 +83,11 @@ router.post('/:profile/start', async (req, res) => {
     const result = await processor.startProcessing(ids, repetitions, useProxy, proxyList);
     res.json({ success: true, ...result });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    // PROXY_REQUIRED = user config error, not a server error -> 400 not 500
+    const isProxyError = err.message?.startsWith('PROXY_REQUIRED:');
+    const status = isProxyError ? 400 : 500;
+    const msg = isProxyError ? err.message.replace('PROXY_REQUIRED: ', '') : err.message;
+    res.status(status).json({ error: msg, code: isProxyError ? 'PROXY_REQUIRED' : 'SERVER_ERROR' });
   }
 });
 
