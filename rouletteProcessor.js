@@ -1,74 +1,159 @@
 /**
- * super-roulette-processor.js — STEALTH ROULETTE (ZERO-LOSS EDITION)
+ * rouletteProcessor.js — STEALTH ROULETTE (ZERO-LOSS EDITION)
+ *
+ * SELF-CONTAINED: proxyUtils inlined — no require('./proxyUtils') needed.
  *
  * ═══════════════════════════════════════════════════════════════
  *  ROOT CAUSE OF LOSSES (250/3000 accounts = ~8% loss rate)
  * ═══════════════════════════════════════════════════════════════
  *
- *  The old code sent the bet at a FIXED DELAY after connecting:
+ *  Old code placed bet at a FIXED TIMER after connecting:
  *    setTimeout(() => gameWs.send(betPayload), 800-1800ms)
  *
- *  Problem: the roulette table has a strict betting window.
- *  Each round cycle:
+ *  Roulette table has a strict round cycle:
  *    [BETTING OPEN ~20s] → [SPINNING ~5s] → [RESULT ~3s] → repeat
  *
- *  If the bot connects during SPINNING or RESULT phase:
- *    - The bet arrives when no bets are accepted
- *    - Server either: silently drops it (loss) or queues it for next
- *      round but the bot has already disconnected (loss)
+ *  If bot connected during SPINNING or RESULT phase → bet arrived when
+ *  server was not accepting bets → server silently dropped it → LOSS.
  *
- *  Manual play never loses because you can SEE the table state.
- *  You don't bet when the wheel is spinning — you wait.
+ *  Manual play never loses because you SEE the table state and wait.
  *
  * ═══════════════════════════════════════════════════════════════
- *  THE FIX — WAIT FOR TABLE STATE BEFORE BETTING
+ *  THE FIX
  * ═══════════════════════════════════════════════════════════════
  *
- *  The server sends a table state message in response to route:31.
- *  This tells us exactly what phase the round is in:
- *    route:31 response → msg.data.status or msg.data.state
- *    status=1 or state='betting' → betting window is OPEN → bet now
- *    status=2/3 or state='spinning'/'result' → window CLOSED → wait
+ *  Server sends a route:31 response with current round phase.
+ *  It also broadcasts automatic state-change messages.
  *
- *  The server also broadcasts phase-change messages automatically.
- *  We listen for BOTH the route:31 response AND the broadcast.
- *  The moment betting opens → we bet immediately.
- *
- *  This is exactly how manual play works. Bot now does the same.
- *
- * ═══════════════════════════════════════════════════════════════
- *  ARCHITECTURE (same as regular/weekend-wheel-processor)
- * ═══════════════════════════════════════════════════════════════
- *
- *  - Slot-indexed 1:1 proxy per worker (eliminates IP rate-limit retries)
- *  - Continuous worker pool — no batch gaps
- *  - Same logging format and stat tracking
- *  - TWO WebSocket connections per account (same as original):
- *      Connection 1: Login  (wss://game.milkywayapp.xyz:7878/)
- *      Connection 2: Game   (wss://game.milkywayapp.xyz:2152/)
- *  - Disconnect immediately after result — never stay on table
- *
- * GAME MESSAGE PROTOCOL (reverse-engineered):
- *
- *  Connection 2 (game server) flow:
- *    → {mainID:1, subID:5}   Enter room
- *    → {mainID:1, subID:4}   Join table
- *    → {route:31, mainID:200, subID:100}  Request table state
- *    ← Table state broadcast: mainID:200, subID:100, data.route=31
- *       data.status: 1=betting_open, 2=spinning, 3=result
- *    → {route:39, mainID:200, subID:100, ...betPayload}  Place bet
- *       ONLY when status=1 (betting window open)
- *    ← Bet result: mainID:200, subID:100, data.route=39
- *       data.winCredit = amount won (0 = no win, still bet)
- *    → Disconnect immediately
+ *  New code:
+ *   1. Sends route:31 after joining (same as before)
+ *   2. WAITS for _isBettingOpen() to return true
+ *   3. Bets the INSTANT the window opens
+ *   4. If connected mid-spin → waits up to 35s for next window
+ *   5. If no window in 35s → SKIPS cleanly (no bet = no loss)
  */
+
+'use strict';
 
 const WebSocket    = require('ws');
 const EventEmitter = require('events');
 const { v4: uuidv4 } = require('uuid');
-const { makeProxyAgent } = require('./proxyUtils');
+const dns          = require('dns').promises;
+const net          = require('net');
 
-// ── Device fingerprint pool ───────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  INLINED PROXY UTILITIES (replaces require('./proxyUtils'))
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * normalizeProxy — converts any proxy format to a canonical URL string.
+ *
+ * Supported formats:
+ *   socks5h://user:pass@host:port   (pass-through)
+ *   socks5://user:pass@host:port
+ *   http://user:pass@host:port
+ *   user:pass@host:port             (no scheme → socks5h://)
+ *   host:port:user:pass             (common list format)
+ */
+function normalizeProxy(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  raw = raw.trim();
+  if (!raw) return null;
+
+  const KNOWN_SCHEMES = ['socks5h://', 'socks5://', 'socks4a://', 'socks4://', 'http://', 'https://'];
+  for (const scheme of KNOWN_SCHEMES) {
+    if (raw.toLowerCase().startsWith(scheme)) {
+      try { new URL(raw); return raw; } catch (_) { return null; }
+    }
+  }
+
+  // Format: host:port:user:pass
+  const hostPortUserPass = raw.match(/^([^:@\s]+):(\d+):([^:@\s]+):([^:@\s]+)$/);
+  if (hostPortUserPass) {
+    const [, host, port, user, pass] = hostPortUserPass;
+    return `socks5h://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+  }
+
+  // Format: user:pass@host:port
+  const userPassAtHostPort = raw.match(/^([^@\s]+):([^@\s]+)@([^:@\s]+):(\d+)$/);
+  if (userPassAtHostPort) {
+    const [, user, pass, host, port] = userPassAtHostPort;
+    return `socks5h://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+  }
+
+  try {
+    const attempt = `socks5h://${raw}`;
+    new URL(attempt);
+    return attempt;
+  } catch (_) {}
+
+  return null;
+}
+
+/**
+ * makeProxyAgent — creates a WebSocket-compatible proxy agent.
+ *
+ * http/https proxies → hpagent HttpsProxyAgent (HTTP CONNECT tunnel)
+ * socks proxies      → socks-proxy-agent SocksProxyAgent
+ *
+ * Special case: if proxy HOST is a domain (not IP), pre-resolves it
+ * to avoid socks-proxy-agent v8 hostname auth bug.
+ */
+async function makeProxyAgent(proxyUrl) {
+  if (!proxyUrl) return null;
+
+  const normalized = normalizeProxy(proxyUrl);
+  if (!normalized) {
+    console.warn(`[proxy] Bad proxy URL: ${proxyUrl}`);
+    return null;
+  }
+
+  let parsed;
+  try { parsed = new URL(normalized); }
+  catch (err) { console.warn(`[proxy] URL parse failed: ${err.message}`); return null; }
+
+  const scheme = parsed.protocol;
+
+  // HTTP / HTTPS proxy
+  if (scheme === 'http:' || scheme === 'https:') {
+    try {
+      const { HttpsProxyAgent } = require('hpagent');
+      return new HttpsProxyAgent({ proxy: normalized, timeout: 15000 });
+    } catch (err) {
+      console.warn(`[proxy] hpagent error: ${err.message}`);
+      return null;
+    }
+  }
+
+  // SOCKS proxy — resolve hostname to IP if needed (socks-proxy-agent v8 bug workaround)
+  const proxyHost = parsed.hostname;
+  const isIp      = net.isIP(proxyHost) !== 0;
+  let   agentUrl  = normalized;
+
+  if (!isIp) {
+    try {
+      const result    = await dns.lookup(proxyHost, { family: 4 });
+      const withIp    = new URL(normalized);
+      withIp.hostname = result.address;
+      agentUrl        = withIp.toString();
+    } catch (dnsErr) {
+      console.warn(`[proxy] DNS resolve failed for ${proxyHost}: ${dnsErr.message} — using hostname`);
+    }
+  }
+
+  try {
+    const { SocksProxyAgent } = require('socks-proxy-agent');
+    return new SocksProxyAgent(agentUrl, { timeout: 15000 });
+  } catch (err) {
+    console.warn(`[proxy] SocksProxyAgent failed: ${err.message}`);
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  FINGERPRINT & UA POOLS
+// ═══════════════════════════════════════════════════════════════
+
 const MOBILE_USER_AGENTS = [
   'Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36',
   'Mozilla/5.0 (Linux; Android 14; SM-S911B Build/UP1A.231005.007) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.105 Mobile Safari/537.36',
@@ -80,6 +165,8 @@ const MOBILE_USER_AGENTS = [
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Mobile/15E148 Safari/604.1',
   'Mozilla/5.0 (Linux; Android 14; OnePlus 12 Build/UP1A.231005.007) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.143 Mobile Safari/537.36',
   'Mozilla/5.0 (Linux; Android 13; 2312DRA50G Build/TKQ1.221114.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 14; SM-S928U Build/UP1A.231005.007) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.143 Mobile Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 13; SM-F946B Build/TP1A.220624.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.163 Mobile Safari/537.36',
 ];
 
 const HEADER_VARIATIONS = [
@@ -90,17 +177,24 @@ const HEADER_VARIATIONS = [
   { 'Accept': 'application/json', 'Accept-Language': 'en-CA,en;q=0.9', 'Accept-Encoding': 'gzip, deflate, br', 'Cache-Control': 'no-cache' },
 ];
 
-function rand(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-function randInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+function rand(arr)            { return arr[Math.floor(Math.random() * arr.length)]; }
+function randInt(min, max)    { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
-// ── Global connection budget (direct/no-proxy mode) ───────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  GLOBAL CONNECTION BUDGET (direct / no-proxy mode)
+// ═══════════════════════════════════════════════════════════════
+
 const globalConnectionTracker = {
   active:    0,
-  MAX_TOTAL: 60, // roulette game server is stricter — lower cap
+  MAX_TOTAL: 60,
   inc()       { this.active++; },
   dec()       { this.active = Math.max(0, this.active - 1); },
   available() { return Math.max(0, this.MAX_TOTAL - this.active); },
 };
+
+// ═══════════════════════════════════════════════════════════════
+//  MAIN PROCESSOR CLASS
+// ═══════════════════════════════════════════════════════════════
 
 class StealthRouletteProcessor extends EventEmitter {
   constructor(db) {
@@ -117,10 +211,10 @@ class StealthRouletteProcessor extends EventEmitter {
     this._useProxy  = false;
 
     this.stats = {
-      successCount:  0,
-      failCount:     0,
-      confirmedBets: 0,
-      skippedBets:   0,   // bet window missed — disconnected cleanly, not a loss
+      successCount:   0,
+      failCount:      0,
+      confirmedBets:  0,
+      skippedBets:    0,
       totalWinAmount: 0,
       activeWorkers:  0,
       processed:      0,
@@ -137,34 +231,25 @@ class StealthRouletteProcessor extends EventEmitter {
     };
 
     this.config = {
-      LOGIN_WS_URL:        'wss://game.milkywayapp.xyz:7878/',
+      LOGIN_WS_URL:          'wss://game.milkywayapp.xyz:7878/',
       SUPER_ROULETTE_WS_URL: 'wss://game.milkywayapp.xyz:2152/',
-      GAME_VERSION:        '2.0.1',
+      GAME_VERSION:          '2.0.1',
 
-      // Worker counts
-      WORKERS_PROXY:  30,  // 30 concurrent with proxy (each has own IP)
-      WORKERS_DIRECT: 20,  // 20 direct (game server is stricter than MegaSpin)
+      WORKERS_PROXY:  30,
+      WORKERS_DIRECT: 20,
 
-      STAGGER_MS:     80,  // ms between launching each worker
+      STAGGER_MS:     80,
       RETRY_ATTEMPTS: 1,
 
       TIMEOUTS: {
-        LOGIN:            12000, // login WS timeout
-        GAME_CONNECT:      8000, // game WS handshake
-        // ── BETTING WINDOW WAIT ──────────────────────────────────────────────
-        // If we connect during SPINNING/RESULT phase, we wait for the next
-        // betting window to open. Max wait = 1 full round cycle.
-        // Typical cycle: 20s betting + 5s spin + 3s result = ~28s total.
-        // We wait up to 35s to cover slow servers.
-        WAIT_FOR_BETTING:  35000,
-        // ── RESULT WAIT ─────────────────────────────────────────────────────
-        // After placing bet, wait for result. Spin+result = ~8s.
-        // Give 15s buffer for slow responses.
-        WAIT_FOR_RESULT:   15000,
-        // ── TOTAL SESSION ────────────────────────────────────────────────────
-        // Hard deadline: login + wait-for-window + bet + result
-        // 12s + 35s + 15s = 62s max. Use 70s for safety.
-        TOTAL_SESSION:     70000,
+        LOGIN:           12000,
+        GAME_CONNECT:     8000,
+        // How long to wait for a betting window after connecting.
+        // Roulette cycle: ~20s bet + 5s spin + 3s result = ~28s.
+        // We wait 35s to cover slow servers.
+        WAIT_FOR_BETTING: 35000,
+        // How long to wait for result after placing bet.
+        WAIT_FOR_RESULT:  15000,
       },
     };
   }
@@ -184,26 +269,20 @@ class StealthRouletteProcessor extends EventEmitter {
       activeWorkers: 0, processed: 0, startTime: Date.now(),
     };
 
-    // ── Proxy setup ───────────────────────────────────────────────────────────
+    // Proxy setup
     if (useProxy && proxyList.length > 0) {
       this._proxyList = this._validateProxies(proxyList);
     }
 
-    // ── Worker count ──────────────────────────────────────────────────────────
+    // Worker count
     let workerCount;
     if (useProxy && this._proxyList.length > 0) {
       workerCount = this.config.WORKERS_PROXY;
-      this._emit('terminal', {
-        type: 'info',
-        message: `🛡️ PROXY ON: ${this._proxyList.length} IPs — 1 IP per worker slot`,
-      });
+      this._emit('terminal', { type: 'info', message: `🛡️ PROXY ON: ${this._proxyList.length} IPs — 1 IP per worker slot` });
     } else {
       const safe = Math.floor(globalConnectionTracker.MAX_TOTAL / Math.max(1, activeUserCount));
       workerCount = Math.max(5, Math.min(this.config.WORKERS_DIRECT, safe));
-      this._emit('terminal', {
-        type: 'warning',
-        message: `⚠️ NO PROXY — direct VPS IP. Workers: ${workerCount} (${activeUserCount} user${activeUserCount > 1 ? 's' : ''} sharing ${globalConnectionTracker.MAX_TOTAL} budget)`,
-      });
+      this._emit('terminal', { type: 'warning', message: `⚠️ NO PROXY — direct VPS IP. Workers: ${workerCount}` });
     }
 
     const all = await this.db.getAllAccounts();
@@ -211,13 +290,13 @@ class StealthRouletteProcessor extends EventEmitter {
       ? all.filter(a => accountIds.includes(a.id))
       : all;
 
-    const estHourly = Math.round(workerCount * (3600 / 25)); // ~25s avg per account
+    const estHourly = Math.round(workerCount * (3600 / 25));
 
     this._emit('terminal', { type: 'info', message: '🎰 SUPER ROULETTE BOT STARTED (ZERO-LOSS EDITION)' });
     this._emit('terminal', { type: 'info', message: `📋 Accounts: ${this.currentAccounts.length} | Workers: ${workerCount} | Bet: ${this.getCurrentBetAmount()} | Est: ~${estHourly.toLocaleString()}/hr` });
     this._emit('terminal', { type: 'info', message: `🔑 Login: ${this.config.LOGIN_WS_URL}` });
     this._emit('terminal', { type: 'info', message: `🎮 Game:  ${this.config.SUPER_ROULETTE_WS_URL}` });
-    this._emit('terminal', { type: 'info', message: `✅ Bet timing: WAITS for betting window — no blind bets` });
+    this._emit('terminal', { type: 'info', message: `✅ Bet timing: WAITS for betting window — no blind bets — no losses` });
     this._emit('status', { running: true, total: this.currentAccounts.length, current: 0, activeWorkers: 0 });
 
     this._runWorkerPool(workerCount);
@@ -289,11 +368,8 @@ class StealthRouletteProcessor extends EventEmitter {
     for (const p of proxyList) {
       const s = (p || '').trim();
       if (!s) continue;
-      const ok = s.startsWith('socks5://') || s.startsWith('socks5h://') ||
-                 s.startsWith('socks4://')  || s.startsWith('http://')   || s.startsWith('https://');
-      let hasHost = false;
-      try { const u = new URL(s); hasHost = u.hostname.length > 0 && !u.hostname.includes(' '); } catch (_) {}
-      if (ok && hasHost) valid.push(s); else bad.push(s);
+      const normalized = normalizeProxy(s);
+      if (normalized) valid.push(normalized); else bad.push(s);
     }
     if (bad.length > 0) {
       this._emit('terminal', { type: 'warning', message: `⚠️ Removed ${bad.length} invalid proxy entries` });
@@ -342,9 +418,6 @@ class StealthRouletteProcessor extends EventEmitter {
         if (this.stats.processed % 25 === 0 || this.stats.processed === total) {
           const elapsed = (Date.now() - this.stats.startTime) / 1000;
           const rate    = elapsed > 0 ? Math.round((this.stats.processed / elapsed) * 3600) : 0;
-          const winRate = this.stats.confirmedBets > 0
-            ? ((this.stats.confirmedBets / (this.stats.confirmedBets + this.stats.failCount)) * 100).toFixed(1)
-            : '0.0';
           this._emit('terminal', {
             type: 'info',
             message: `📊 ${this.stats.processed}/${total} | ✅${this.stats.confirmedBets} bet | ⏭️${this.stats.skippedBets} skip | ❌${this.stats.failCount} err | 💰${this.stats.totalWinAmount} won | ⚡${rate.toLocaleString()}/hr | 👷${this.stats.activeWorkers}`,
@@ -386,32 +459,21 @@ class StealthRouletteProcessor extends EventEmitter {
       result
     ).catch(() => {});
 
-    // Skipped = missed betting window — not a loss, not a failure
     if (result.skipped) {
       this.stats.skippedBets++;
-      this._emit('progress', {
-        index: globalIndex, total: this.currentAccounts.length,
-        account: account.username, success: false, skipped: true,
-        winAmount: 0,
-      });
+      this._emit('progress', { index: globalIndex, total: this.currentAccounts.length, account: account.username, success: false, skipped: true, winAmount: 0 });
       return result;
     }
 
-    // Confirmed bet placed and result received
     if (result.confirmed) {
       this.stats.successCount++;
       this.stats.confirmedBets++;
       this.stats.totalWinAmount += (result.winCredit || 0);
       this.emit('betUpdate', { winAmount: result.winCredit, currentBet: this.getCurrentBetAmount() });
-      this._emit('progress', {
-        index: globalIndex, total: this.currentAccounts.length,
-        account: account.username, success: true,
-        winAmount: result.winCredit || 0,
-      });
+      this._emit('progress', { index: globalIndex, total: this.currentAccounts.length, account: account.username, success: true, winAmount: result.winCredit || 0 });
       return result;
     }
 
-    // Network/timeout error — retry once with rotated proxy
     if (!result.confirmed && attempt < this.config.RETRY_ATTEMPTS) {
       this._log(globalIndex, 'warning', `🔄 Retry ${attempt + 1} — ${result.error}`);
       await this._sleep(300 + Math.floor(Math.random() * 200));
@@ -422,17 +484,17 @@ class StealthRouletteProcessor extends EventEmitter {
     return result;
   }
 
-  // ── Full account session: Login → Game → Bet → Result ─────────────────────────
+  // ── Full session: Login → Game → Wait for window → Bet → Result ───────────────
 
   async _runAccountSession(account, index, slotIndex) {
-    const sessionId   = uuidv4().substring(0, 8);
-    const userAgent   = rand(MOBILE_USER_AGENTS);
-    const headers     = rand(HEADER_VARIATIONS);
-    const proxyUrl    = this._getProxyForSlot(slotIndex);
+    const sessionId = uuidv4().substring(0, 8);
+    const userAgent = rand(MOBILE_USER_AGENTS);
+    const headers   = rand(HEADER_VARIATIONS);
+    const proxyUrl  = this._getProxyForSlot(slotIndex);
 
-    this._log(index, 'info', `[${sessionId}] ${account.username} | proxy:${proxyUrl ? proxyUrl.split('@').pop() : 'direct'}`);
+    this._log(index, 'info', `[${sessionId}] ${account.username}`);
 
-    // ── Phase 1: Login ────────────────────────────────────────────────────────
+    // Phase 1: Login
     let loginResult;
     try {
       loginResult = await this._login(account, userAgent, headers, proxyUrl, index, sessionId);
@@ -446,7 +508,7 @@ class StealthRouletteProcessor extends EventEmitter {
 
     Object.assign(account, loginResult.accountData);
 
-    // ── Phase 2: Game (enter room → wait for betting window → bet → result) ────
+    // Phase 2: Game — enter room, wait for betting window, bet, get result
     try {
       return await this._gameBetAndResult(account, userAgent, headers, proxyUrl, index, sessionId);
     } catch (err) {
@@ -486,25 +548,16 @@ class StealthRouletteProcessor extends EventEmitter {
       };
 
       if (proxyUrl) {
-        try {
-          const agent = await makeProxyAgent(proxyUrl);
-          if (agent) wsOptions.agent = agent;
-        } catch (_) {}
+        try { const agent = await makeProxyAgent(proxyUrl); if (agent) wsOptions.agent = agent; } catch (_) {}
       }
 
-      try {
-        ws = new WebSocket(this.config.LOGIN_WS_URL, ['wl'], wsOptions);
-      } catch (err) {
-        clearTimeout(timer);
-        return resolve({ success: false, error: `Login WS create: ${err.message}` });
-      }
+      try { ws = new WebSocket(this.config.LOGIN_WS_URL, ['wl'], wsOptions); }
+      catch (err) { clearTimeout(timer); return resolve({ success: false, error: `Login WS: ${err.message}` }); }
 
       ws.on('open', () => {
         ws.send(JSON.stringify({
-          account:  account.username,
-          password: account.password,
-          version:  this.config.GAME_VERSION,
-          mainID:   100, subID: 6,
+          account: account.username, password: account.password,
+          version: this.config.GAME_VERSION, mainID: 100, subID: 6,
         }));
       });
 
@@ -513,17 +566,13 @@ class StealthRouletteProcessor extends EventEmitter {
         try {
           const msg = JSON.parse(raw.toString());
           if (msg.mainID === 100 && msg.subID === 116) {
-            const loginTime = Date.now() - startTime;
             if (msg.data?.result === 0) {
-              this._log(index, 'success', `✅ Login ${loginTime}ms`);
+              this._log(index, 'success', `✅ Login ${Date.now() - startTime}ms`);
               finish({
-                success: true, loginTime,
+                success: true,
                 accountData: {
-                  userid:      msg.data.userid,
-                  dynamicpass: msg.data.dynamicpass,
-                  bossid:      msg.data.bossid,
-                  gameid:      msg.data.gameid,
-                  score:       msg.data.score,
+                  userid: msg.data.userid, dynamicpass: msg.data.dynamicpass,
+                  bossid: msg.data.bossid, gameid: msg.data.gameid, score: msg.data.score,
                 },
               });
             } else {
@@ -538,38 +587,32 @@ class StealthRouletteProcessor extends EventEmitter {
     });
   }
 
-  // ── Game WebSocket (Connection 2): Enter → Wait for window → Bet → Result ─────
+  // ── Game WebSocket (Connection 2) — THE CORE FIX ─────────────────────────────
   //
-  // THE CORE FIX IS HERE.
+  // KEY DIFFERENCE FROM OLD CODE:
+  //   OLD: setTimeout(sendBet, 800-1800ms)  — blind, causes losses
+  //   NEW: wait for _isBettingOpen() signal, THEN bet
   //
-  // Old approach: setTimeout(sendBet, 800-1800ms)  ← blind, causes losses
-  // New approach: wait for table state message confirming betting is OPEN, then bet
-  //
-  // The server sends route:31 response with the current round phase.
-  // It also broadcasts automatic state-change messages.
-  // We listen for both and bet the INSTANT the window opens.
-  //
-  // If we connect during an open window → bet immediately.
-  // If we connect during spinning/result → wait up to 35s for next window.
-  // If 35s passes with no window → skip this account (no bet = no loss).
+  // The server sends a route:31 response and periodic broadcasts.
+  // We check every message. Bet fires the instant the window is confirmed open.
 
   _gameBetAndResult(account, userAgent, headers, proxyUrl, index, sessionId) {
     return new Promise(async (resolve) => {
-      let ws            = null;
-      let done          = false;
-      let closed        = false;
-      let betSent       = false;
-      let heartbeatIv   = null;
-      let resultTimer   = null;
-      let windowTimer   = null;
+      let ws           = null;
+      let done         = false;
+      let closed       = false;
+      let betSent      = false;
+      let heartbeatIv  = null;
+      let resultTimer  = null;
+      let windowTimer  = null;
 
       // Hard session deadline
       const sessionTimer = setTimeout(() => {
         if (!done) {
-          this._log(index, 'warning', `⏰ Session deadline — ${betSent ? 'bet was sent but no result' : 'betting window never opened'}`);
+          this._log(index, 'warning', `⏰ Session deadline — ${betSent ? 'no result after bet' : 'window never opened'}`);
           finish(betSent
-            ? { confirmed: false, error: 'Session deadline — result not received' }
-            : { confirmed: false, skipped: true, error: 'Session deadline — betting window never opened' }
+            ? { confirmed: false, error: 'No result received after bet' }
+            : { confirmed: false, skipped: true, error: 'Betting window never opened — skipped' }
           );
         }
       }, this.config.TIMEOUTS.WAIT_FOR_BETTING + this.config.TIMEOUTS.WAIT_FOR_RESULT);
@@ -591,69 +634,56 @@ class StealthRouletteProcessor extends EventEmitter {
         resolve(result);
       };
 
-      // Called when we confirm the betting window is OPEN — send bet immediately
+      // Called when betting window confirmed open — send bet immediately
       const sendBet = () => {
         if (betSent || done || !ws || ws.readyState !== WebSocket.OPEN) return;
         betSent = true;
-
         const amount = this.getCurrentBetAmount();
         this._log(index, 'info', `🎯 Betting window OPEN → placing bet ${amount}`);
         ws.send(JSON.stringify(this._createBetPayload()));
 
-        // Start result wait timer — if no result in WAIT_FOR_RESULT, it's an error
+        // Start result wait timer
         resultTimer = setTimeout(() => {
           if (!done) {
-            this._log(index, 'warning', `⏰ Result timeout after bet was sent`);
-            finish({ confirmed: false, error: 'Result timeout after bet' });
+            this._log(index, 'warning', `⏰ Result timeout after bet`);
+            finish({ confirmed: false, error: 'Result timeout after bet sent' });
           }
         }, this.config.TIMEOUTS.WAIT_FOR_RESULT);
       };
 
-      // ── Build WebSocket ───────────────────────────────────────────────────
       const wsOptions = {
         handshakeTimeout: this.config.TIMEOUTS.GAME_CONNECT,
         headers: { 'User-Agent': userAgent, 'Origin': 'http://localhost', ...headers },
       };
 
       if (proxyUrl) {
-        try {
-          const agent = await makeProxyAgent(proxyUrl);
-          if (agent) wsOptions.agent = agent;
-        } catch (_) {}
+        try { const agent = await makeProxyAgent(proxyUrl); if (agent) wsOptions.agent = agent; } catch (_) {}
       }
 
-      try {
-        ws = new WebSocket(this.config.SUPER_ROULETTE_WS_URL, ['wl'], wsOptions);
-      } catch (err) {
-        clearTimeout(sessionTimer);
-        return resolve({ confirmed: false, error: `Game WS create: ${err.message}` });
-      }
+      try { ws = new WebSocket(this.config.SUPER_ROULETTE_WS_URL, ['wl'], wsOptions); }
+      catch (err) { clearTimeout(sessionTimer); return resolve({ confirmed: false, error: `Game WS: ${err.message}` }); }
 
       ws.on('open', () => {
         this._log(index, 'success', `🎮 Game connected`);
 
         const send = (payload, delay) => setTimeout(() => {
-          if (ws && ws.readyState === WebSocket.OPEN && !done) {
-            ws.send(JSON.stringify(payload));
-          }
+          if (ws && ws.readyState === WebSocket.OPEN && !done) ws.send(JSON.stringify(payload));
         }, delay);
 
-        // Room entry sequence — same as manual play
+        // Room entry sequence (matches manual play)
         send({ mainID: 1, subID: 5, userid: account.userid, password: account.dynamicpass }, 50);
         send({ mainID: 1, subID: 4, gameid: account.gameid || 10658796, password: account.dynamicpass, reenter: 0 }, 200);
-        // Request table state — response tells us what phase the round is in
-        send({ route: 31, mainID: 200, subID: 100 }, 400);
+        send({ route: 31, mainID: 200, subID: 100 }, 400); // ← request table state
+        send({ mainID: 1, subID: 6, bossid: account.bossid }, 600);
 
-        // Heartbeat — keeps connection alive while waiting for betting window
+        // Heartbeat to keep connection alive while waiting for window
         heartbeatIv = setInterval(() => {
           if (ws && ws.readyState === WebSocket.OPEN && !done) {
             ws.send(JSON.stringify({ mainID: 1, subID: 6, bossid: account.bossid }));
           }
         }, 5000);
 
-        send({ mainID: 1, subID: 6, bossid: account.bossid }, 600);
-
-        // Safety: if no table state received within WAIT_FOR_BETTING → skip
+        // Skip timer — if window never opens in WAIT_FOR_BETTING ms → skip cleanly
         windowTimer = setTimeout(() => {
           if (!done && !betSent) {
             this._log(index, 'warning', `⏭️ No betting window in ${this.config.TIMEOUTS.WAIT_FOR_BETTING / 1000}s — skipping`);
@@ -667,68 +697,47 @@ class StealthRouletteProcessor extends EventEmitter {
         try {
           const msg = JSON.parse(raw.toString());
 
-          // ── Balance update ──────────────────────────────────────────────────
+          // Track balance
           if (msg.mainID === 1 && msg.subID === 104 && msg.data?.score != null) {
             account.score = msg.data.score;
           }
 
-          // ── Table state / phase-change messages ─────────────────────────────
-          //
-          // The server sends route:31 response AND periodic broadcasts.
-          // We check every relevant message for betting-window signals.
-          //
-          // Known phase indicators (observed from live captures):
-          //   msg.data.status === 1  → betting open (most servers)
-          //   msg.data.state === 'betting' or 'open'
-          //   msg.data.bettingOpen === true
-          //   msg.data.route === 31 with status=1
-          //   msg.data.phase === 1 or 'bet'
-          //
-          // We also watch for the round-start broadcast that fires when
-          // the previous round's result clears and new betting opens.
-
           if (msg.mainID === 200 && msg.subID === 100) {
             const d = msg.data || {};
 
-            // ── Route 31: Table state response ──────────────────────────────
+            // Route 31: table state response — check if betting window is open
             if (d.route === 31) {
               this._log(index, 'info', `🎲 Table state: status=${d.status} phase=${d.phase} bettingOpen=${d.bettingOpen}`);
-
-              const isOpen = this._isBettingOpen(d);
-              if (isOpen && !betSent) {
-                clearTimeout(windowTimer); // cancel skip timer
+              if (this._isBettingOpen(d) && !betSent) {
+                clearTimeout(windowTimer);
                 sendBet();
-              } else if (!isOpen) {
-                this._log(index, 'info', `⏳ Betting window not open (status:${d.status}) — waiting for next round...`);
-                // Keep waiting — the server will broadcast when window opens
+              } else if (!this._isBettingOpen(d)) {
+                this._log(index, 'info', `⏳ Waiting for next betting window (status:${d.status})...`);
               }
               return;
             }
 
-            // ── Route 39: Bet result ────────────────────────────────────────
+            // Route 39: bet result
             if (d.route === 39 && betSent) {
               const winCredit    = d.winCredit    || 0;
               const playerCredit = d.playerCredit || account.score;
               account.score = playerCredit;
-
               this._log(index, 'success', `🎉 BET CONFIRMED | Win:${winCredit} | Bal:${playerCredit}`);
               finish({ confirmed: true, winCredit, newBalance: playerCredit });
               return;
             }
 
-            // ── Phase broadcast (round start / betting open) ────────────────
-            // The server broadcasts a message when betting opens for a new round.
-            // Check all messages for betting-open signals.
+            // Any other message — check for betting-open broadcast
             if (!betSent && this._isBettingOpen(d)) {
-              this._log(index, 'info', `🟢 Betting window broadcast detected — betting now`);
+              this._log(index, 'info', `🟢 Betting window broadcast → betting now`);
               clearTimeout(windowTimer);
               sendBet();
             }
           }
 
-          // ── Catch-all: some servers use different mainID for broadcasts ────
+          // Catch-all for servers using different mainID for broadcasts
           if (!betSent && msg.data && this._isBettingOpen(msg.data)) {
-            this._log(index, 'info', `🟢 Betting open signal (mainID:${msg.mainID} subID:${msg.subID})`);
+            this._log(index, 'info', `🟢 Betting signal (mainID:${msg.mainID} subID:${msg.subID})`);
             clearTimeout(windowTimer);
             sendBet();
           }
@@ -746,7 +755,7 @@ class StealthRouletteProcessor extends EventEmitter {
       ws.on('close', () => {
         if (!done) {
           finish(betSent
-            ? { confirmed: false, error: 'Game WS closed after bet — no result received' }
+            ? { confirmed: false, error: 'Game WS closed after bet — no result' }
             : { confirmed: false, skipped: true, error: 'Game WS closed before bet' }
           );
         }
@@ -757,40 +766,36 @@ class StealthRouletteProcessor extends EventEmitter {
   /**
    * _isBettingOpen — checks a message data object for any betting-window signal.
    *
-   * Game servers vary in how they signal the betting window. We check all
-   * known patterns from live captures across multiple server builds.
-   *
-   * A bet sent when this returns FALSE will be silently dropped by the server
-   * = loss. A bet sent when this returns TRUE will be accepted = no loss.
+   * Returns true ONLY when we are certain the window is open.
+   * A bet sent when this returns false = dropped by server = loss.
+   * We check every known signal pattern from live server captures.
    */
   _isBettingOpen(d) {
     if (!d) return false;
 
-    // Most common: status field
-    // 1 = betting open, 2 = spinning, 3 = result/settle
-    if (d.status === 1)           return true;
-    if (d.status === 2 || d.status === 3) return false;
+    // status field: 1=betting open, 2=spinning, 3=result
+    if (d.status === 1)                     return true;
+    if (d.status === 2 || d.status === 3)   return false;
 
-    // Phase field (alternate naming)
+    // phase field
     if (d.phase === 1 || d.phase === 'bet' || d.phase === 'betting') return true;
     if (d.phase === 2 || d.phase === 3)                              return false;
 
-    // Explicit boolean
+    // explicit boolean
     if (d.bettingOpen === true)  return true;
     if (d.bettingOpen === false) return false;
 
-    // State string field
+    // state string
     if (typeof d.state === 'string') {
       const s = d.state.toLowerCase();
       if (s === 'betting' || s === 'open' || s === 'bet') return true;
       if (s === 'spinning' || s === 'spin' || s === 'result' || s === 'settle') return false;
     }
 
-    // countDown/timer field — if present and > 0, betting is open on many servers
+    // countdown/timer fields (betting open = time remaining > 0)
     if (typeof d.countDown === 'number' && d.countDown > 0) return true;
     if (typeof d.betTime   === 'number' && d.betTime   > 0) return true;
 
-    // No recognizable signal — don't bet blindly
     return false;
   }
 
@@ -800,13 +805,12 @@ class StealthRouletteProcessor extends EventEmitter {
     this.isProcessing = false;
     const elapsed = this.stats.startTime
       ? ((Date.now() - this.stats.startTime) / 1000).toFixed(1) : '?';
-    const rate = elapsed > 0
-      ? Math.round((this.stats.processed / elapsed) * 3600) : 0;
+    const rate = elapsed > 0 ? Math.round((this.stats.processed / elapsed) * 3600) : 0;
 
     this._emit('terminal', { type: 'success', message: '\n🎉 ALL DONE!' });
     this._emit('terminal', {
       type: 'info',
-      message: `✅ Bets placed: ${this.stats.confirmedBets} | ⏭️ Skipped: ${this.stats.skippedBets} | ❌ Errors: ${this.stats.failCount}`,
+      message: `✅ Bets confirmed: ${this.stats.confirmedBets} | ⏭️ Skipped: ${this.stats.skippedBets} | ❌ Errors: ${this.stats.failCount}`,
     });
     this._emit('terminal', {
       type: 'info',
@@ -816,7 +820,7 @@ class StealthRouletteProcessor extends EventEmitter {
     if (this.stats.skippedBets > 0) {
       this._emit('terminal', {
         type: 'warning',
-        message: `ℹ️  ${this.stats.skippedBets} accounts skipped — connected during spin/result phase (NOT losses — just missed the window). Re-run to pick them up.`,
+        message: `ℹ️  ${this.stats.skippedBets} skipped (connected mid-spin, not losses). Re-run to pick them up.`,
       });
     }
 
@@ -843,10 +847,7 @@ class StealthRouletteProcessor extends EventEmitter {
   _emit(event, data) { this.emit(event, data); }
 
   _log(index, type, message) {
-    this.emit('terminal', {
-      type, message: `[${index}] ${message}`,
-      timestamp: new Date().toISOString(),
-    });
+    this.emit('terminal', { type, message: `[${index}] ${message}`, timestamp: new Date().toISOString() });
   }
 
   _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
