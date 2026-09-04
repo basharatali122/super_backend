@@ -89,17 +89,29 @@ class StealthRouletteProcessor extends EventEmitter {
     this.currentAccounts = [];
     this.activeProcesses = new Map();
 
+    // 🛡️ LOSS CONTROL CONFIGURATION
     this.config = {
       LOGIN_WS_URL: 'wss://game.milkywayapp.xyz:7878/',
       SUPER_ROULETTE_WS_URL: 'wss://game.milkywayapp.xyz:2152/',
       GAME_VERSION: '2.0.1',
-      MAX_CONCURRENT: 5,
+      
+      // ⚡ Speed settings (slightly reduced for stability)
+      MAX_CONCURRENT: 4,
       MIN_CONCURRENT: 2,
+      
+      // 🛡️ Loss Control
+      MAX_LOSS_PER_ACCOUNT: 20,
+      RETRY_ON_LOSS: 2,
+      STOP_ON_LOSS: true,
+      
+      // ⏱️ Extended timeouts
+      LOGIN_TIMEOUT: { MIN: 12000, MAX: 20000 },
+      GAME_TIMEOUT: 30000,
+      BET_CONFIRM_TIMEOUT: 25000,
+      RESULT_WAIT: 20000,
+      
       RANDOM_ORDER: true,
-      CYCLE_DELAY: { MIN: 3000, MAX: 8000 },
-      LOGIN_TIMEOUT: { MIN: 10000, MAX: 18000 },
-      GAME_TIMEOUT: 25000,
-      RESULT_WAIT: 15000,
+      CYCLE_DELAY: { MIN: 5000, MAX: 10000 },
     };
 
     this.stats = {
@@ -107,8 +119,10 @@ class StealthRouletteProcessor extends EventEmitter {
       failCount: 0,
       confirmedBets: 0,
       totalScoreWon: 0,
+      totalScoreLost: 0,
       activeSessions: 0,
-      totalLoss: 0,
+      netProfit: 0,
+      lossCount: 0,
     };
 
     this.betConfig = {
@@ -122,6 +136,7 @@ class StealthRouletteProcessor extends EventEmitter {
 
     this.useProxy = false;
     this.proxyList = [];
+    this.accountLossTracker = new Map();
   }
 
   async startProcessing(accountIds, repetitions = 1, useProxy = false, proxyList = []) {
@@ -147,6 +162,7 @@ class StealthRouletteProcessor extends EventEmitter {
     this.isProcessing = true;
     this.useProxy = true;
     this.proxyList = validProxies;
+    this.accountLossTracker = new Map();
 
     const accounts = await this.db.getAllAccounts();
     this.currentAccounts = accounts.filter(a => accountIds.includes(a.id));
@@ -161,10 +177,22 @@ class StealthRouletteProcessor extends EventEmitter {
     this.totalCycles = Math.max(1, Math.min(10, parseInt(repetitions) || 1));
     this.currentCycle = 0;
 
-    this.emit('terminal', { type: 'info', message: 'STEALTH MODE ACTIVATED - Fixed Game Flow' });
-    this.emit('terminal', { type: 'info', message: `Accounts: ${this.currentAccounts.length}` });
-    this.emit('terminal', { type: 'info', message: `Proxy: ON (${validProxies.length} IPs)` });
-    this.emit('terminal', { type: 'info', message: `Bet: ${this.getCurrentBetAmount()}` });
+    this.stats = {
+      successCount: 0,
+      failCount: 0,
+      confirmedBets: 0,
+      totalScoreWon: 0,
+      totalScoreLost: 0,
+      activeSessions: 0,
+      netProfit: 0,
+      lossCount: 0,
+    };
+
+    this.emit('terminal', { type: 'info', message: '🛡️ STEALTH MODE ACTIVATED - Loss Control Enabled' });
+    this.emit('terminal', { type: 'info', message: `📋 Accounts: ${this.currentAccounts.length}` });
+    this.emit('terminal', { type: 'info', message: `🔒 Max Loss/Account: ${this.config.MAX_LOSS_PER_ACCOUNT}` });
+    this.emit('terminal', { type: 'info', message: `🔄 Retry on Loss: ${this.config.RETRY_ON_LOSS}` });
+    this.emit('terminal', { type: 'info', message: `🎯 Bet: ${this.getCurrentBetAmount()}` });
 
     this.startMonitor();
     this.processCycles();
@@ -179,13 +207,13 @@ class StealthRouletteProcessor extends EventEmitter {
       const cycleStartDelay = randInt(1000, 4000);
       await this.sleep(cycleStartDelay);
 
-      this.emit('terminal', { type: 'info', message: `\nCycle ${cycle}/${this.totalCycles} starting...` });
+      this.emit('terminal', { type: 'info', message: `\n🔄 Cycle ${cycle}/${this.totalCycles} starting...` });
 
       await this.processAccounts();
 
       if (cycle < this.totalCycles && this.isProcessing) {
         const delay = randInt(this.config.CYCLE_DELAY.MIN, this.config.CYCLE_DELAY.MAX);
-        this.emit('terminal', { type: 'info', message: `Waiting ${Math.round(delay/1000)}s before next cycle...` });
+        this.emit('terminal', { type: 'info', message: `⏳ Waiting ${Math.round(delay/1000)}s before next cycle...` });
         await this.sleep(delay);
       }
     }
@@ -207,7 +235,16 @@ class StealthRouletteProcessor extends EventEmitter {
 
       while (activePromises.size < targetConcurrent && processed < total) {
         const account = this.currentAccounts[processed];
-        const promise = this.processAccount(account, processed);
+        
+        // Check loss limit
+        const accountLoss = this.accountLossTracker.get(account.id) || 0;
+        if (accountLoss >= this.config.MAX_LOSS_PER_ACCOUNT) {
+          this.emit('terminal', { type: 'warning', message: `⛔ Skipping ${account.username} - Loss limit reached (${accountLoss})` });
+          processed++;
+          continue;
+        }
+        
+        const promise = this.processAccountWithLossControl(account, processed);
         promise.completed = false;
         promise.then(() => { promise.completed = true; });
         activePromises.add(promise);
@@ -226,10 +263,14 @@ class StealthRouletteProcessor extends EventEmitter {
     await Promise.allSettled(activePromises);
   }
 
-  async processAccount(account, index) {
+  async processAccountWithLossControl(account, index) {
     const sessionId = uuidv4().substring(0, 8);
     this.activeProcesses.set(sessionId, account.username);
     this.stats.activeSessions++;
+
+    let retryCount = 0;
+    let result = null;
+    let lossDetected = false;
 
     try {
       this.emit('status', {
@@ -242,13 +283,54 @@ class StealthRouletteProcessor extends EventEmitter {
 
       await this.sleep(randInt(100, 500));
 
-      const result = await this.stealthAccountFlow(account, index, sessionId);
-
-      if (result.success) {
-        this.stats.successCount++;
-        if (result.winCredit > 0) {
+      do {
+        result = await this.stealthAccountFlow(account, index, sessionId);
+        
+        if (result && result.isLoss === true) {
+          lossDetected = true;
+          const currentLoss = this.accountLossTracker.get(account.id) || 0;
+          this.accountLossTracker.set(account.id, currentLoss + this.getCurrentBetAmount());
+          
+          this.emit('terminal', { 
+            type: 'warning', 
+            message: `💸 Loss on ${account.username}: ${this.getCurrentBetAmount()} (Total: ${this.accountLossTracker.get(account.id)})` 
+          });
+          
+          // Update loss stats
+          this.stats.totalScoreLost += this.getCurrentBetAmount();
+          this.stats.lossCount++;
+        } else if (result && result.winCredit > 0) {
+          // Win - reduce loss tracker
+          const currentLoss = this.accountLossTracker.get(account.id) || 0;
+          const reducedLoss = Math.max(0, currentLoss - result.winCredit);
+          this.accountLossTracker.set(account.id, reducedLoss);
+          
+          this.emit('terminal', { 
+            type: 'success', 
+            message: `🎉 Win on ${account.username}: +${result.winCredit} (Loss reduced to: ${reducedLoss})` 
+          });
+          
+          // Update win stats
           this.stats.totalScoreWon += result.winCredit;
         }
+        
+        if (lossDetected && retryCount < this.config.RETRY_ON_LOSS && this.isProcessing) {
+          retryCount++;
+          this.emit('terminal', { 
+            type: 'info', 
+            message: `🔄 Retry ${account.username} (${retryCount}/${this.config.RETRY_ON_LOSS})` 
+          });
+          await this.sleep(randInt(2000, 4000));
+          lossDetected = false;
+        } else {
+          break;
+        }
+        
+      } while (lossDetected && retryCount < this.config.RETRY_ON_LOSS && this.isProcessing);
+
+      // Update final statistics
+      if (result && result.success) {
+        this.stats.successCount++;
         if (result.confirmed) {
           this.stats.confirmedBets++;
         }
@@ -260,13 +342,17 @@ class StealthRouletteProcessor extends EventEmitter {
         });
       } else {
         this.stats.failCount++;
-        this.stats.totalLoss += this.getCurrentBetAmount();
       }
 
+      // Update net profit
+      this.stats.netProfit = this.stats.totalScoreWon - this.stats.totalScoreLost;
+
       this.emit('progress', {
-        index, total: this.currentAccounts.length,
+        index, 
+        total: this.currentAccounts.length,
         account: account.username,
-        success: result.success,
+        success: result ? result.success : false,
+        loss: result ? result.isLoss : false,
         stats: { ...this.stats },
       });
 
@@ -274,7 +360,6 @@ class StealthRouletteProcessor extends EventEmitter {
 
     } catch (error) {
       this.stats.failCount++;
-      this.stats.totalLoss += this.getCurrentBetAmount();
       return { success: false, error: error.message };
     } finally {
       this.stats.activeSessions--;
@@ -294,6 +379,8 @@ class StealthRouletteProcessor extends EventEmitter {
 
     this.log(index, 'info', `${sessionId} | ${fingerprint.model.substring(0, 15)}`);
 
+    const initialBalance = account.score || 0;
+
     const loginResult = await this.stealthLogin(account, userAgent, finalHeaders, proxy, index, sessionId);
     if (!loginResult.success) {
       return { success: false, error: loginResult.error };
@@ -303,7 +390,9 @@ class StealthRouletteProcessor extends EventEmitter {
 
     await this.sleep(randInt(100, 300));
 
-    const gameResult = await this.stealthGameFlow(account, userAgent, finalHeaders, proxy, index, sessionId);
+    const gameResult = await this.stealthGameFlowWithBalanceCheck(
+      account, userAgent, finalHeaders, proxy, index, sessionId, initialBalance
+    );
 
     return gameResult;
   }
@@ -355,7 +444,7 @@ class StealthRouletteProcessor extends EventEmitter {
             cleanup();
 
             if (msg.data?.result === 0) {
-              this.log(index, 'success', `Login ${loginTime}ms`);
+              this.log(index, 'success', `✅ Login ${loginTime}ms`);
               resolve({
                 success: true,
                 loginTime,
@@ -388,17 +477,17 @@ class StealthRouletteProcessor extends EventEmitter {
     });
   }
 
-  async stealthGameFlow(account, userAgent, headers, proxy, index, sessionId) {
+  async stealthGameFlowWithBalanceCheck(account, userAgent, headers, proxy, index, sessionId, initialBalance) {
     return new Promise((resolve) => {
       let gameWs = null;
       let heartbeatInterval = null;
       let completed = false;
-      let balanceChanged = false;
       let betPlaced = false;
       let resultReceived = false;
-      let initialBalance = account.score || 0;
-      let finalBalance = initialBalance;
       let winCredit = 0;
+      let finalBalance = initialBalance;
+      let balanceBeforeBet = initialBalance;
+      let lossDetected = false;
 
       const finish = (result) => {
         if (completed) return;
@@ -407,24 +496,40 @@ class StealthRouletteProcessor extends EventEmitter {
         if (heartbeatInterval) clearInterval(heartbeatInterval);
         if (gameWs) this.safeClose(gameWs);
 
-        resolve(result);
+        // Final balance check for loss detection
+        if (betPlaced && !resultReceived) {
+          if (finalBalance < balanceBeforeBet) {
+            lossDetected = true;
+            this.log(index, 'warning', `💸 LOSS: ${balanceBeforeBet} → ${finalBalance}`);
+          } else if (finalBalance === balanceBeforeBet) {
+            this.log(index, 'warning', `⚠️ Balance unchanged - possible loss`);
+            lossDetected = true;
+          }
+        }
+
+        resolve({
+          success: result.success || false,
+          confirmed: resultReceived,
+          newBalance: finalBalance,
+          winCredit: winCredit,
+          isLoss: lossDetected,
+        });
       };
 
       const gameTimeout = this.config.GAME_TIMEOUT;
 
       const mainTimeout = setTimeout(() => {
         if (!completed) {
-          this.log(index, 'warning', `Game timeout after ${gameTimeout/1000}s`);
-
-          if (betPlaced && !resultReceived) {
-            this.log(index, 'warning', 'Bet placed but no result - assuming loss');
+          this.log(index, 'warning', `⏰ Game timeout`);
+          
+          if (betPlaced && finalBalance < balanceBeforeBet) {
+            lossDetected = true;
           }
-
+          
           finish({
-            success: balanceChanged,
-            confirmed: resultReceived,
-            newBalance: finalBalance,
-            winCredit: winCredit,
+            success: false,
+            confirmed: false,
+            winCredit: 0,
           });
         }
       }, gameTimeout);
@@ -439,7 +544,7 @@ class StealthRouletteProcessor extends EventEmitter {
       gameWs = new WebSocket(this.config.SUPER_ROULETTE_WS_URL, ['wl'], wsOptions);
 
       gameWs.on('open', () => {
-        this.log(index, 'success', `Game connected`);
+        this.log(index, 'success', `🎮 Game connected`);
 
         const sendWithDelay = (payload, delay) => {
           setTimeout(() => {
@@ -449,7 +554,6 @@ class StealthRouletteProcessor extends EventEmitter {
           }, delay);
         };
 
-        // Step 1: Enter game
         sendWithDelay({
           mainID: 1,
           subID: 5,
@@ -457,7 +561,6 @@ class StealthRouletteProcessor extends EventEmitter {
           password: account.dynamicpass
         }, randInt(100, 300));
 
-        // Step 2: Join game
         sendWithDelay({
           mainID: 1,
           subID: 4,
@@ -466,14 +569,12 @@ class StealthRouletteProcessor extends EventEmitter {
           reenter: 0
         }, randInt(400, 700));
 
-        // Step 3: Initialize
         sendWithDelay({
           route: 31,
           mainID: 200,
           subID: 100
         }, randInt(700, 1100));
 
-        // Heartbeat
         const heartbeatIntervalMs = randInt(4000, 8000);
         heartbeatInterval = setInterval(() => {
           if (gameWs && gameWs.readyState === WebSocket.OPEN && !completed) {
@@ -481,36 +582,46 @@ class StealthRouletteProcessor extends EventEmitter {
           }
         }, heartbeatIntervalMs);
 
-        // Step 4: Table data
         sendWithDelay({
           mainID: 1,
           subID: 6,
           bossid: account.bossid
         }, randInt(1000, 1500));
 
-        // Step 5: Place bet (1200-2000ms delay for natural timing)
         const betDelay = randInt(1200, 2000);
         setTimeout(() => {
           if (gameWs && gameWs.readyState === WebSocket.OPEN && !completed) {
             const betAmount = this.getCurrentBetAmount();
             betPlaced = true;
-            this.log(index, 'info', `Betting ${betAmount}`);
+            balanceBeforeBet = account.score || initialBalance;
+            
+            this.log(index, 'info', `🎯 Bet ${betAmount} (Bal: ${balanceBeforeBet})`);
 
             const betPayload = this.createBetPayload(betAmount);
             gameWs.send(JSON.stringify(betPayload));
 
-            // Start result wait timeout after bet
-            setTimeout(() => {
+            const resultTimeout = setTimeout(() => {
               if (!completed && !resultReceived) {
-                this.log(index, 'warning', 'Result wait timeout - assuming loss');
+                this.log(index, 'warning', `⏰ Result timeout - checking balance...`);
+                
+                if (account.score !== undefined) {
+                  finalBalance = account.score;
+                }
+                
+                if (finalBalance < balanceBeforeBet) {
+                  lossDetected = true;
+                  this.log(index, 'error', `💸 LOSS: ${balanceBeforeBet} → ${finalBalance}`);
+                }
+                
                 finish({
                   success: false,
                   confirmed: false,
-                  newBalance: account.score,
                   winCredit: 0,
                 });
               }
             }, this.config.RESULT_WAIT);
+            
+            gameWs._resultTimeout = resultTimeout;
           }
         }, betDelay);
       });
@@ -521,19 +632,19 @@ class StealthRouletteProcessor extends EventEmitter {
         try {
           const msg = JSON.parse(raw.toString());
 
-          // Balance update
           if (msg.mainID === 1 && msg.subID === 104 && msg.data?.score != null) {
-            if (msg.data.score !== account.score) {
-              balanceChanged = true;
-              account.score = msg.data.score;
-              finalBalance = msg.data.score;
-            }
+            finalBalance = msg.data.score;
+            account.score = finalBalance;
           }
 
-          // Bet result confirmation
           if (msg.mainID === 200 && msg.subID === 100 && msg.data?.route === 39) {
             resultReceived = true;
             clearTimeout(mainTimeout);
+            
+            if (gameWs._resultTimeout) {
+              clearTimeout(gameWs._resultTimeout);
+              delete gameWs._resultTimeout;
+            }
 
             winCredit = msg.data.winCredit || 0;
             const playerCredit = msg.data.playerCredit || account.score;
@@ -541,9 +652,11 @@ class StealthRouletteProcessor extends EventEmitter {
             account.score = playerCredit;
 
             if (winCredit > 0) {
-              this.log(index, 'success', `Won ${winCredit} | Balance: ${playerCredit}`);
+              this.log(index, 'success', `🎉 WIN: +${winCredit} | Bal: ${playerCredit}`);
+              lossDetected = false;
             } else {
-              this.log(index, 'info', `Lost bet | Balance: ${playerCredit}`);
+              lossDetected = true;
+              this.log(index, 'warning', `💸 LOSS: ${this.getCurrentBetAmount()} lost | Bal: ${playerCredit}`);
             }
 
             finish({
@@ -551,6 +664,7 @@ class StealthRouletteProcessor extends EventEmitter {
               confirmed: true,
               newBalance: playerCredit,
               winCredit: winCredit,
+              isLoss: lossDetected,
             });
           }
         } catch (e) {}
@@ -558,23 +672,32 @@ class StealthRouletteProcessor extends EventEmitter {
 
       gameWs.on('error', (err) => {
         if (!completed) {
-          this.log(index, 'error', `Game error: ${err.message}`);
+          this.log(index, 'error', `❌ Game error: ${err.message}`);
+          
+          if (betPlaced && finalBalance < balanceBeforeBet) {
+            lossDetected = true;
+          }
+          
           finish({
-            success: balanceChanged,
+            success: false,
             confirmed: false,
-            newBalance: finalBalance,
             winCredit: 0,
+            isLoss: lossDetected,
           });
         }
       });
 
       gameWs.on('close', () => {
         if (!completed) {
+          if (betPlaced && finalBalance < balanceBeforeBet) {
+            lossDetected = true;
+          }
+          
           finish({
-            success: balanceChanged,
+            success: resultReceived,
             confirmed: resultReceived,
-            newBalance: finalBalance,
             winCredit: winCredit,
+            isLoss: lossDetected,
           });
         }
       });
@@ -648,7 +771,7 @@ class StealthRouletteProcessor extends EventEmitter {
 
       this.emit('terminal', {
         type: 'info',
-        message: `${this.stats.successCount}/${total} (${rate}%) | Active: ${this.stats.activeSessions} | Won: ${this.stats.totalScoreWon} | Loss: ${this.stats.totalLoss}`,
+        message: `📊 ${this.stats.successCount}/${total} (${rate}%) | Active: ${this.stats.activeSessions} | Won: ${this.stats.totalScoreWon} | Lost: ${this.stats.totalScoreLost} | Profit: ${this.stats.netProfit}`,
       });
     }, 15000);
   }
@@ -656,7 +779,7 @@ class StealthRouletteProcessor extends EventEmitter {
   async stopProcessing() {
     this.isProcessing = false;
     await this.cleanup();
-    this.emit('terminal', { type: 'warning', message: 'Stealth mode stopped' });
+    this.emit('terminal', { type: 'warning', message: '🛑 Stealth mode stopped' });
     this.emit('status', { running: false });
     return { success: true };
   }
@@ -688,7 +811,7 @@ class StealthRouletteProcessor extends EventEmitter {
       return false;
     }
     this.betConfig.totalBet = amount;
-    this.emit('terminal', { type: 'info', message: `Bet changed to: ${amount}` });
+    this.emit('terminal', { type: 'info', message: `💰 Bet changed to: ${amount}` });
     return true;
   }
 
@@ -697,13 +820,18 @@ class StealthRouletteProcessor extends EventEmitter {
     const total = this.stats.successCount + this.stats.failCount;
     const rate = total > 0 ? ((this.stats.successCount / total) * 100).toFixed(1) : '0.0';
 
-    this.emit('terminal', { type: 'success', message: `\nCOMPLETE: ${this.stats.successCount}/${total} (${rate}%) | Won: ${this.stats.totalScoreWon} | Loss: ${this.stats.totalLoss}` });
+    this.emit('terminal', { type: 'success', message: `\n🎉 COMPLETE: ${this.stats.successCount}/${total} (${rate}%)` });
+    this.emit('terminal', { type: 'info', message: `💰 Won: ${this.stats.totalScoreWon} | Lost: ${this.stats.totalScoreLost} | Net: ${this.stats.netProfit}` });
+    this.emit('terminal', { type: 'info', message: `💸 Loss Count: ${this.stats.lossCount} | Confirmed Bets: ${this.stats.confirmedBets}` });
+
     this.emit('completed', {
       successCount: this.stats.successCount,
       failCount: this.stats.failCount,
       totalScoreWon: this.stats.totalScoreWon,
+      totalScoreLost: this.stats.totalScoreLost,
+      netProfit: this.stats.netProfit,
       confirmedBets: this.stats.confirmedBets,
-      totalLoss: this.stats.totalLoss,
+      lossCount: this.stats.lossCount,
     });
     this.emit('status', { running: false });
   }
